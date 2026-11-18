@@ -35,7 +35,11 @@ param(
     [string]$Language = 'auto',
     [switch]$Cli,
     [switch]$SelfTest,
-    [string]$FfmpegPath
+    [string]$FfmpegPath,
+    # auto: graphics-chip encoder when one works, else the processor.
+    # cpu: always the processor (troubleshooting).
+    [ValidateSet('auto', 'cpu')]
+    [string]$EncoderMode = 'auto'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -56,6 +60,12 @@ $script:CurPassStart = 0.0
 $script:CurPassLen = 1.0
 $script:TotalParts = 1
 $script:JobClock = $null
+$script:EtaClock = $null
+$script:EtaBase = 0.0
+$script:ReadingVideos = $false
+# Encoder picked earlier in this session, per quality/mode, so the
+# graphics-chip check runs once per session rather than once per run.
+$script:EncoderCache = @{}
 
 function Write-FileLog {
     param([string]$Message)
@@ -116,6 +126,64 @@ function Format-MB {
     return ('{0:0.0} MB' -f ($Bytes / 1000000.0))
 }
 
+function Wait-ProcessResponsive {
+    param([System.Diagnostics.Process]$Process, [int]$Milliseconds)
+    # Wait up to $Milliseconds for the process to exit (-1: no limit), and
+    # keep the window answering the whole time. The window shares this
+    # thread, so a long blocking wait makes it ignore clicks: restoring it
+    # from the taskbar while minimised then only works by luck. Waiting in
+    # short slices and handling window messages between them keeps it
+    # responsive within ~15 ms. Returns $true once the process has exited.
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        if ($script:HasGui) {
+            if ($Process.WaitForExit(15)) { return $true }
+            try { [System.Windows.Forms.Application]::DoEvents() } catch { }
+        } else {
+            if ($Process.WaitForExit(100)) { return $true }
+        }
+        if ($Milliseconds -ge 0 -and $clock.ElapsedMilliseconds -ge $Milliseconds) { return $false }
+    }
+}
+
+function Invoke-FFmpegCapture {
+    param([string[]]$Arguments, [int]$TimeoutMs = 60000)
+
+    # Run ffmpeg as a plain process and read stderr as text. Calling it with
+    # "& ffmpeg ... 2>&1" breaks under Windows PowerShell 5.1: with
+    # $ErrorActionPreference = 'Stop', its first stderr line (the normal
+    # "Input #0, ..." header) is raised as a terminating error.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $script:Ffmpeg
+    $psi.Arguments = ($Arguments | ForEach-Object { ConvertTo-Arg ([string]$_) }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $false
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        if (-not (Wait-ProcessResponsive -Process $proc -Milliseconds $TimeoutMs)) {
+            try { $proc.Kill() } catch { }
+            return [pscustomobject]@{ ExitCode = -1; Text = ''; TimedOut = $true }
+        }
+        $proc.WaitForExit()
+        return [pscustomobject]@{ ExitCode = $proc.ExitCode; Text = [string]$errTask.Result; TimedOut = $false }
+    } finally {
+        if (-not $proc.HasExited) { try { $proc.Kill() } catch { } }
+        $proc.Dispose()
+    }
+}
+
+function Invoke-FFmpegProbe {
+    param([string]$VideoPath)
+    $r = Invoke-FFmpegCapture -Arguments @('-hide_banner', '-nostdin', '-i', $VideoPath)
+    if ($r.TimedOut) { throw ((Get-Str 'errNotVideo') -f (Split-Path -Leaf $VideoPath)) }
+    return $r.Text
+}
+
 function Get-MediaInfo {
     param([string]$VideoPath)
 
@@ -125,8 +193,8 @@ function Get-MediaInfo {
 
     # ffmpeg prints the stream table when given only -i. Exit code 1 is normal
     # here because no output file was requested.
-    $lines = @(& $script:Ffmpeg -hide_banner -i $VideoPath 2>&1 | ForEach-Object { [string]$_ })
-    $text = $lines -join "`n"
+    $text = Invoke-FFmpegProbe -VideoPath $VideoPath
+    $lines = @($text -split "`r?`n")
 
     $dm = [regex]::Match($text, 'Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)')
     if (-not $dm.Success) {
@@ -134,7 +202,8 @@ function Get-MediaInfo {
     }
     $duration = ([int]$dm.Groups[1].Value * 3600) + ([int]$dm.Groups[2].Value * 60) + [double]$dm.Groups[3].Value
 
-    $videoLine = @($lines | Where-Object { $_ -match 'Stream #\d+:\d+.*Video:' }) | Select-Object -First 1
+    # Skip cover art / thumbnails, which ffmpeg also lists as video streams.
+    $videoLine = @($lines | Where-Object { $_ -match 'Stream #\d+:\d+.*Video:' -and $_ -notmatch '\(attached pic\)' }) | Select-Object -First 1
     if (-not $videoLine) {
         throw ((Get-Str 'errNoVideoTrack') -f (Split-Path -Leaf $VideoPath))
     }
@@ -145,6 +214,10 @@ function Get-MediaInfo {
     }
     $width = [int]$dim.Groups[1].Value
     $height = [int]$dim.Groups[2].Value
+
+    # HDR (PQ / HLG): iPhone records HLG by default, Samsung HDR10+ uses PQ.
+    # These need tone mapping, or the SDR result looks grey and washed out.
+    $hdr = ($videoLine -match '\b(smpte2084|arib-std-b67)\b')
 
     $rotation = 0
     $rm = [regex]::Match($text, 'rotation of\s+(-?[\d.]+)\s+degrees')
@@ -179,6 +252,7 @@ function Get-MediaInfo {
         Rotation = $rotation
         Fps      = $fps
         Channels = $channels
+        Hdr      = [bool]$hdr
         Size     = $size
     }
 }
@@ -191,7 +265,8 @@ function Get-EncodePlan {
         [bool]$Mute,
         [int]$Width,
         [int]$Height,
-        [double]$Fps
+        [double]$Fps,
+        [bool]$Hdr = $false
     )
 
     if ($DurationSec -le 0) { throw 'Internal error: zero-length part.' }
@@ -215,6 +290,11 @@ function Get-EncodePlan {
     $filters = @()
     if ($Fps -gt 31) { $filters += 'fps=30' }
 
+    # ffmpeg's scaler tone-maps HDR to SDR (perceptual intent) when asked
+    # for BT.709 output, so HDR needs no extra filter library.
+    $toSdr = ''
+    if ($Hdr) { $toSdr = ':out_primaries=bt709:out_transfer=bt709:out_color_matrix=bt709:out_range=tv' }
+
     $pixels = [double]$Width * [double]$Height
     if ($pixels -gt $capPixels) {
         $factor = [math]::Sqrt($capPixels / $pixels)
@@ -222,17 +302,25 @@ function Get-EncodePlan {
         $newH = [int]([math]::Floor(($Height * $factor) / 2.0) * 2)
         if ($newW -lt 2) { $newW = 2 }
         if ($newH -lt 2) { $newH = 2 }
-        $filters += "scale=${newW}:${newH}:flags=lanczos"
+        $filters += "scale=${newW}:${newH}:flags=lanczos$toSdr"
     } elseif (($Width % 2) -ne 0 -or ($Height % 2) -ne 0) {
-        $filters += 'scale=trunc(iw/2)*2:trunc(ih/2)*2'
+        $filters += "scale=trunc(iw/2)*2:trunc(ih/2)*2$toSdr"
+    } elseif ($Hdr) {
+        $filters += "scale=iw:ih$toSdr"
     }
     $filters += 'format=yuv420p'
+
+    # Tag the output as SDR BT.709 after tone mapping, so players do not
+    # treat it as HDR.
+    $colorArgs = @()
+    if ($Hdr) { $colorArgs = @('-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709') }
 
     return [pscustomobject]@{
         TargetBytes = $targetBytes
         VideoKbps   = $videoKbps
         AudioKbps   = $(if ($Mute) { 0 } else { $AudioKbps })
         VideoFilter = ($filters -join ',')
+        ColorArgs   = $colorArgs
     }
 }
 

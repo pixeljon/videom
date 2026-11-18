@@ -1,7 +1,7 @@
 1 ICON "videomail.ico"
 1 VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -11,12 +11,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "VideoMail"
             VALUE "FileDescription", "VideoMail - split long videos for email"
-            VALUE "FileVersion", "1.0"
+            VALUE "FileVersion", "1.1"
             VALUE "InternalName", "VideoMail"
             VALUE "LegalCopyright", "Copyright (c) 2026 VideoMail contributors"
             VALUE "OriginalFilename", "VideoMail.exe"
             VALUE "ProductName", "VideoMail"
-            VALUE "ProductVersion", "1.0"
+            VALUE "ProductVersion", "1.1"
         END
     END
     BLOCK "VarFileInfo"

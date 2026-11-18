@@ -1,0 +1,77 @@
+name: release
+
+# Official Windows zips are built here, never on a personal machine.
+# Push a tag like v1.1 to build and publish; "Run workflow" builds without
+# publishing (the zip is kept as a workflow artifact).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write      # create the GitHub Release
+  id-token: write      # sign the build provenance
+  attestations: write  # store it, for "gh attestation verify"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tag matches the version in package.sh
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          want="v$(sed -n 's/^version="\(.*\)"$/\1/p' build/package.sh)"
+          if [ "$GITHUB_REF_NAME" != "$want" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.sh version ($want)." >&2
+            exit 1
+          fi
+
+      - name: Build in the pinned container
+        run: |
+          docker build -t videomail-build build
+          mkdir -p out
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/src:ro" -v "$PWD/out:/out" videomail-build
+
+      - name: Self-test the packaged app
+        run: |
+          mkdir check
+          unzip -q out/VideoMail-*-win64.zip -d check
+          pwsh -NoProfile -File check/VideoMail/VideoMail.ps1 -SelfTest
+
+      - name: Sign build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/VideoMail-*-win64.zip
+
+      - name: Keep the zip as an artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: VideoMail-win64
+          path: out/
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Release notes: this version's section of CHANGELOG.md.
+          awk -v v="$version" '
+            $0 ~ "^## " v " " {on=1; next}
+            on && /^## / {exit}
+            on {print}
+          ' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "Built by GitHub Actions from this tag in the pinned container (build/Dockerfile)."
+            echo "Verify: \`gh attestation verify VideoMail-$version-win64.zip --repo $GITHUB_REPOSITORY\`"
+            echo "SHA-256: \`$(cut -d' ' -f1 out/VideoMail-$version-win64.zip.sha256)\`"
+          } >> notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            "out/VideoMail-$version-win64.zip" "out/VideoMail-$version-win64.zip.sha256" \
+            --title "VideoMail $version" --notes-file notes.md

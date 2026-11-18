@@ -10,7 +10,7 @@ cd "$root"
 TC="${TC:-$root/.build/tc/usr/bin}"
 export PATH="$TC:$PATH"
 
-version="1.0"
+version="1.1"
 dist="$root/dist"
 app="$dist/VideoMail"
 stamp="202611180000"
@@ -109,17 +109,25 @@ def patch(path):
 for p in sys.argv[1:]:
     patch(p)
 EOF
-cp VideoMail.ps1 README.txt LICENSES.txt "$app/"
+cp VideoMail.ps1 README.txt LICENSES.txt assets/videomail.ico "$app/"
 cp .build/src/ffmpeg-*/COPYING.GPLv2 "$app/COPYING.GPLv2.txt"
-cp assets/launcher.c assets/app.rc build/build-windows.sh build/package.sh "$app/source/"
+cp assets/launcher.c assets/app.rc build/build-windows.sh build/package.sh \
+   build/Dockerfile build/reproducible-build.sh "$app/source/"
 cat > "$app/source/BUILD.txt" <<'EOF'
 How these files were built
 ==========================
 
 ffmpeg.exe
-  build-windows.sh in this folder. It builds ffmpeg 9.0.2 and x264
-  from source with mingw-w64 for 64-bit Windows, and links everything
-  statically. Source: https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz
+  build-windows.sh in this folder. It builds ffmpeg 9.0.2, x264,
+  dav1d 1.5.1 and Intel libvpl 2.17.0 from source with mingw-w64 for
+  64-bit Windows, and links everything statically. NVIDIA (nv-codec-headers
+  n11.1.5.3) and AMD (AMF headers 1.5.3) support is headers only; the
+  graphics driver provides the encoder at run time.
+  Sources: https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz
+           https://downloads.videolan.org/pub/videolan/dav1d/1.5.1/dav1d-1.5.1.tar.xz
+           https://github.com/intel/libvpl/archive/refs/tags/v2.17.0.tar.gz
+           https://git.videolan.org/git/ffmpeg/nv-codec-headers.git (n11.1.5.3)
+           https://github.com/GPUOpen-LibrariesAndSDKs/AMF/releases/download/v1.5.3/AMF-headers-v1.5.3.tar.gz
 
 VideoMail.exe
   launcher.c + app.rc, with mingw-w64:
@@ -135,6 +143,17 @@ VideoMail.ps1
 package.sh also zeroes the PE timestamps of the shipped binaries and
 normalises the zip timestamps, so nothing about the build machine is
 recorded in this package.
+
+Reproducible build
+  Official releases are built by GitHub Actions inside the pinned
+  container in Dockerfile (base image by digest, compiler packages by
+  snapshot.debian.org date, every source by SHA-256 or git commit; see
+  reproducible-build.sh). Rebuilding the same release tag that way gives
+  a byte-identical zip:
+
+    docker build -t videomail-build build
+    docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" videomail-build
+    sha256sum out/VideoMail-*-win64.zip
 EOF
 
 # Batch files need CRLF line endings.
@@ -142,13 +161,18 @@ for f in VideoMail.bat Troubleshooting.bat; do
     sed 's/\r$//; s/$/\r/' "$f" > "$app/$f"
 done
 
-# Normalize timestamps so the zip does not record the build machine's clock.
+# Fixed permissions and timestamps: the zip records neither the build
+# machine's umask nor its clock.
+find "$app" -type d -exec chmod 755 {} +
+find "$app" -type f -exec chmod 644 {} +
+chmod 755 "$app"/*.exe "$app"/*.dll
 TZ=UTC find "$app" -exec touch -t "$stamp" {} +
 
 echo "== zip =="
 rm -f "$dist/VideoMail-$version-win64.zip"
 ( cd "$dist"
-  TZ=UTC zip -X -9 -r "VideoMail-$version-win64.zip" VideoMail >/dev/null
+  # Sorted entries: filesystem order differs between machines.
+  find VideoMail -print | LC_ALL=C sort | TZ=UTC zip -X -9 -@ "VideoMail-$version-win64.zip" >/dev/null
   sha256sum "VideoMail-$version-win64.zip" > "VideoMail-$version-win64.zip.sha256"
 )
 

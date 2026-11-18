@@ -41,9 +41,20 @@ function Invoke-Batch {
     $tempDir = Join-Path ([IO.Path]::GetTempPath()) ('VideoMail_' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
-    $preset = Get-QualityPreset -Quality ([string]$Config.Quality)
+    $quality = [string]$Config.Quality
+    $preset = Get-QualityPreset -Quality $quality
+    $mode = [string]$Config.EncoderMode
+    if (-not $mode) { $mode = 'auto' }
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $script:JobClock = $clock
+    $script:EtaClock = [System.Diagnostics.Stopwatch]::StartNew()
+    $script:EtaBase = 0.0
+
+    # Parts finished by an earlier run into this folder (with the same
+    # settings) are kept and skipped.
+    $state = Read-PartState -OutDir $outDir
+    $prints = @($jobs | ForEach-Object { Get-JobFingerprint -Job $_ -Quality $quality })
+    $encoder = $null
 
     $greeting = [string]$Config.Greeting
     if (-not $greeting.Trim()) { $greeting = (Get-Str 'greetingDefault') }
@@ -57,7 +68,32 @@ function Invoke-Batch {
             Update-OverallProgress -Fraction 0 -Speed 0 -Elapsed $clock.Elapsed.TotalSeconds -Stage (Get-Str 'stageStarting')
 
             Write-AppLog (((Get-Str 'logPart') -f (Get-Str 'wordPart'), ($i + 1), $jobs.Count, $jobs[$i].FileName))
-            Invoke-EncodeJob -Job $jobs[$i] -Preset $preset -TempDir $tempDir
+            if (Test-ExistingPart -Job $jobs[$i] -Fingerprint $prints[$i] -State $state) {
+                Write-AppLog ((Get-Str 'logReuse') -f $jobs[$i].FileName)
+                $script:EtaBase = ($i + 1) / $jobs.Count
+                $script:EtaClock.Restart()
+            } else {
+                if (Test-Path -LiteralPath $jobs[$i].Output) {
+                    Write-AppLog ((Get-Str 'logReuseStale') -f $jobs[$i].FileName)
+                }
+                if (-not $encoder) {
+                    $encoder = Select-VideoEncoder -Job $jobs[$i] -Quality $quality -Preset $preset -Mode $mode
+                    Write-AppLog ((Get-Str 'logEncoder') -f $encoder.Name)
+                }
+                try {
+                    Invoke-EncodeJob -Job $jobs[$i] -Encoder $encoder -TempDir $tempDir -Fingerprint $prints[$i] -OutDir $outDir
+                } catch {
+                    $why = $_.Exception.Message
+                    if ($script:CancelRequested -or $why -eq 'Cancelled' -or -not $encoder.Gpu) { throw }
+                    # The graphics chip failed mid-run (driver hiccup, sleep,
+                    # unusual frame): finish the job on the processor instead.
+                    Write-AppLog ((Get-Str 'logEncoderFallback') -f $why)
+                    $encoder = @(Get-EncoderCandidates -Quality $quality -Preset $preset -Mode 'cpu')[0]
+                    $script:EncoderCache["$quality|$mode"] = $encoder.Id
+                    Write-AppLog ((Get-Str 'logEncoder') -f $encoder.Name)
+                    Invoke-EncodeJob -Job $jobs[$i] -Encoder $encoder -TempDir $tempDir -Fingerprint $prints[$i] -OutDir $outDir
+                }
+            }
 
             $script:CurPartIndex = $i + 1
             $script:CurPassStart = 0.0
@@ -100,9 +136,18 @@ function Invoke-Batch {
             Get-ChildItem -LiteralPath $outDir -Filter '*.part' -ErrorAction SilentlyContinue |
                 Remove-Item -Force -ErrorAction SilentlyContinue
             Write-AppLog (Get-Str 'logCancelledByUser')
+            # Report what was kept, so the next run's "Part N" is expected.
+            $kept = 0
+            $nextPart = 0
+            $state = Read-PartState -OutDir $outDir
+            for ($j = 0; $j -lt $jobs.Count; $j++) {
+                if (Test-ExistingPart -Job $jobs[$j] -Fingerprint $prints[$j] -State $state) { $kept++ }
+                elseif ($nextPart -eq 0) { $nextPart = $j + 1 }
+            }
             return [pscustomobject]@{
                 Cancelled = $true; PartCount = 0; DraftMode = 'none'; DraftCount = 0
                 DraftDir = ''; DraftError = ''; OutDir = $outDir; Seconds = $clock.Elapsed.TotalSeconds
+                KeptParts = $kept; NextPart = $nextPart
             }
         }
         throw
@@ -138,6 +183,7 @@ function Invoke-Cli {
         Greeting = $Greeting
         To       = $To
         NoDrafts = [bool]$NoDrafts
+        EncoderMode = $EncoderMode
     }
 
     $result = Invoke-Batch -Config $config
@@ -194,6 +240,30 @@ function Invoke-SelfTest {
     Assert-True ($fit.Plan.VideoKbps -gt 1000) 'video budget is sane'
     $p1080 = Get-EncodePlan -DurationSec 300 -TargetMB 49 -AudioKbps 96 -Mute $false -Width 1920 -Height 1080 -Fps 30
     Assert-True ($p1080.VideoFilter -match 'scale=1280:720') '1080p scales to 720p'
+    Assert-True ($p1080.VideoFilter -notmatch 'out_transfer') 'SDR is not tone-mapped'
+    Assert-Equal @($p1080.ColorArgs).Count 0 'SDR keeps source colour tags'
+    $pHdr = Get-EncodePlan -DurationSec 300 -TargetMB 49 -AudioKbps 96 -Mute $false -Width 3840 -Height 2160 -Fps 60 -Hdr $true
+    Assert-True ($pHdr.VideoFilter -match '^fps=30,scale=1280:720:flags=lanczos:out_primaries=bt709:out_transfer=bt709') 'HDR 4K60 is tone-mapped while scaling'
+    Assert-True ((@($pHdr.ColorArgs) -join ' ') -eq '-colorspace bt709 -color_primaries bt709 -color_trc bt709') 'HDR output tagged BT.709'
+    $pHdrSmall = Get-EncodePlan -DurationSec 300 -TargetMB 49 -AudioKbps 96 -Mute $false -Width 640 -Height 360 -Fps 30 -Hdr $true
+    Assert-True ($pHdrSmall.VideoFilter -match '^scale=iw:ih:out_primaries=bt709') 'HDR without resize is still tone-mapped'
+
+    # Encoder choice: graphics chip first, processor last; "best" stays 2-pass x264.
+    $cBest = @(Get-EncoderCandidates -Quality 'best' -Preset 'medium')
+    Assert-Equal $cBest.Count 1 'best uses one encoder'
+    Assert-True ($cBest[0].Id -eq 'x264' -and $cBest[0].TwoPass) 'best is two-pass x264'
+    $cAuto = @(Get-EncoderCandidates -Quality 'balanced' -Preset 'fast')
+    Assert-Equal (($cAuto | ForEach-Object { $_.Id }) -join ',') 'nvenc,nvenc-basic,qsv,amf,x264' 'balanced tries GPUs then CPU'
+    Assert-True (-not $cAuto[-1].TwoPass) 'CPU fallback is one pass'
+    $cCpu = @(Get-EncoderCandidates -Quality 'fast' -Preset 'veryfast' -Mode 'cpu')
+    Assert-True ($cCpu.Count -eq 1 -and $cCpu[0].Id -eq 'x264' -and $cCpu[0].Preset -eq 'veryfast') 'cpu mode skips GPUs'
+    Assert-True ((Get-EncoderFilter -Plan $p1080 -Encoder $cAuto[0]) -match ',format=nv12$') 'GPU gets nv12 frames'
+    Assert-True ((Get-EncoderFilter -Plan $p1080 -Encoder $cCpu[0]) -match ',format=yuv420p$') 'CPU gets yuv420p frames'
+    $a1 = (@(Get-VideoEncoderArgs -Encoder $cCpu[0] -Kbps 1000) -join ' ')
+    Assert-True ($a1 -match '-b:v 1000k -maxrate 1500k -bufsize 2000k') 'one-pass caps the peak rate'
+    $a2 = (@(Get-VideoEncoderArgs -Encoder $cBest[0] -Kbps 1000) -join ' ')
+    Assert-True ($a2 -match '-b:v 1000k' -and $a2 -notmatch 'maxrate') 'two-pass keeps plain bitrate'
+    Assert-True ((@(Get-VideoEncoderArgs -Encoder $cAuto[2] -Kbps 1000) -join ' ') -match '^-c:v h264_qsv') 'qsv args'
 
     $muted = Get-EncodePlan -DurationSec 300 -TargetMB 49 -AudioKbps 96 -Mute $true -Width 1920 -Height 1080 -Fps 30
     Assert-Equal $muted.AudioKbps 0 'muted audio budget'
@@ -239,6 +309,24 @@ function Invoke-SelfTest {
         Assert-Equal $two.Count 2 'two email groups'
         $single = Group-JobsForEmail -Jobs @($fj[0]) -MaxBytes 5000
         Assert-Equal $single.Count 1 'single part stays wrapped'
+
+        # Resume record: a finished part is reused only with matching settings.
+        $plan = Get-EncodePlan -DurationSec 60 -TargetMB 2 -AudioKbps 96 -Mute $false -Width 1280 -Height 720 -Fps 30
+        $planMuted = Get-EncodePlan -DurationSec 60 -TargetMB 2 -AudioKbps 96 -Mute $true -Width 1280 -Height 720 -Fps 30
+        $rj = [pscustomobject]@{ Source = $PSCommandPath; Output = $f1; FileName = 'a.mp4'; Start = 0; Duration = 60; Plan = $plan }
+        $rjMuted = [pscustomobject]@{ Source = $PSCommandPath; Output = $f1; FileName = 'a.mp4'; Start = 0; Duration = 60; Plan = $planMuted }
+        $fp = Get-JobFingerprint -Job $rj -Quality 'balanced'
+        Assert-Equal $fp (Get-JobFingerprint -Job $rj -Quality 'balanced') 'fingerprint is stable'
+        Assert-True ($fp -ne (Get-JobFingerprint -Job $rjMuted -Quality 'balanced')) 'mute changes fingerprint'
+        Assert-True ($fp -ne (Get-JobFingerprint -Job $rj -Quality 'best')) 'quality changes fingerprint'
+        Assert-True (-not (Test-ExistingPart -Job $rj -Fingerprint $fp -State (Read-PartState $tmp))) 'unrecorded part is not reused'
+        [IO.File]::WriteAllBytes($f1, (New-Object byte[] 5000))
+        Save-PartState -OutDir $tmp -FileName 'a.mp4' -Fingerprint $fp
+        $st = Read-PartState $tmp
+        Assert-True (Test-ExistingPart -Job $rj -Fingerprint $fp -State $st) 'recorded part is reused'
+        Assert-True (-not (Test-ExistingPart -Job $rjMuted -Fingerprint (Get-JobFingerprint -Job $rjMuted -Quality 'balanced') -State $st)) 'part with other settings is not reused'
+        Save-PartState -OutDir $tmp -FileName 'b.mp4' -Fingerprint 'x'
+        Assert-Equal (Read-PartState $tmp).Count 2 'part record keeps earlier entries'
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }

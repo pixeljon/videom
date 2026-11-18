@@ -1,4 +1,4 @@
-﻿VideoMail 1.0
+﻿VideoMail 1.1
 =============
 
 WHAT IT DOES
@@ -12,8 +12,11 @@ HOW TO USE
 1. Double-click VideoMail.exe. Keep every file in this folder together.
 2. Drag one or more videos onto the big blue box.
 3. Press "Split & prepare emails".
-4. Wait. A 1-hour video usually takes 20-60 minutes; "Fastest" is quicker,
-   "Best quality" is slower. Keep the window open and the laptop plugged in.
+4. Wait. With the PC's graphics chip (used automatically when it works)
+   a 1-hour video takes roughly 5-15 minutes; on the processor alone,
+   roughly 15-40 minutes. "Best quality" is slower. Keep the window open
+   and the laptop plugged in. You can cancel: finished parts are kept and
+   the next run continues where it stopped.
 5. When it says Done, open Outlook -> Drafts. Check each draft, press Send.
 
 The parts are saved in "VideoMail parts" next to the original video.
@@ -24,6 +27,7 @@ VideoMail.exe        double-click this
 VideoMail.ps1        the program (keep it next to the exe)
 ffmpeg.exe           the video encoder (keep it next to the exe)
 libwinpthread-1.dll  runtime piece used by ffmpeg (keep it there)
+videomail.ico        the app icon (window and taskbar)
 README.txt           this file
 Troubleshooting.bat  only needed if VideoMail.exe will not start
 source\              build recipe and license details (not needed to run)
@@ -54,7 +58,8 @@ OPTIONS
   choose 35 MB and run again. At 49 MB each email carries one part;
   with smaller sizes, two or more parts can share one email.
 - Part length: 5 minutes by default.
-- Quality: Best quality / Balanced / Fastest.
+- Quality: Best quality / Balanced / Fastest. Balanced and Fastest use the
+  graphics chip when possible; Best quality uses two processor passes.
 - Greeting: the text at the top of every draft ("Hello," by default).
 - Send drafts to: optional; fills the To line on every draft.
 - Save parts in: where the MP4 files go.
@@ -82,14 +87,24 @@ IF SOMETHING GOES WRONG
 - Antivirus may scan the first run; allow it.
 - If Outlook refuses a message as too large, set 35 MB and run again.
 - Log file: %TEMP%\VideoMail.log
-- Re-running into the same folder reuses parts that are already complete.
+- Re-running into the same folder reuses finished parts made with the same
+  settings (a hidden .videomail-parts.txt file records them). Change mute,
+  size, part length or quality and the parts are made again.
+- The log shows which encoder was used ("Encoder: graphics chip ..." or
+  "Encoder: processor ...").
 - A very deep folder path (over 260 characters) can fail on older Windows;
   save to something shorter such as C:\VideoMail parts.
 
 SUPPORTED INPUT
-MP4, MOV, M4V, MKV, WebM, AVI, WMV, ASF, FLV, TS, MTS, M2TS, MPG, MPEG, 3GP, DV.
-Video: H.264, HEVC, MPEG-2, MPEG-4, H.263, DV, VP8/VP9, AV1, WMV/VC-1, ProRes.
-Audio: AAC, MP3, MP2, AC3/E-AC3, FLAC, Opus, Vorbis, WMA, AMR.
+MP4, MOV, M4V, MKV, WebM, AVI, WMV, ASF, FLV, F4V, TS, MTS, M2TS, MPG, MPEG,
+VOB, MOD, TOD, 3GP, DV, OGV, MXF.
+Video: H.264, HEVC, AV1, VP8/VP9, MPEG-2, MPEG-4 (DivX/Xvid), H.263, DV,
+WMV/VC-1, ProRes, DNxHD, MJPEG, Theora.
+Audio: AAC, MP3, MP2, AC3/E-AC3, DTS, TrueHD, FLAC, ALAC, Opus, Vorbis,
+WMA/WMA Pro, AMR, PCM, ADPCM.
+Phone videos (iPhone, Samsung and other Android phones) work as they are,
+including portrait clips, 60/120 fps, 4K and HDR. HDR is converted to
+normal colours.
 
 PRIVACY
 Everything happens on this PC. Nothing is uploaded.
@@ -98,5 +113,6 @@ file next to the program (or in %APPDATA%\VideoMail if the folder is
 read-only).
 
 LICENSE
-The VideoMail scripts and launcher are MIT. ffmpeg, x264 and the MinGW
-runtime are under their own licenses; see LICENSES.txt.
+The VideoMail scripts and launcher are MIT. ffmpeg, x264, dav1d, libvpl,
+the NVIDIA and AMD encoder headers and the MinGW runtime are under their
+own licenses; see LICENSES.txt.

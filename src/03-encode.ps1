@@ -58,6 +58,7 @@ function Invoke-FFmpeg {
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardError = $true
     $psi.RedirectStandardOutput = $false
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 
     $proc = [System.Diagnostics.Process]::Start($psi)
     $errTask = $proc.StandardError.ReadToEndAsync()
@@ -65,10 +66,9 @@ function Invoke-FFmpeg {
 
     try {
         while (-not $proc.HasExited) {
-            Start-Sleep -Milliseconds 250
-            if ($script:HasGui) {
-                try { [System.Windows.Forms.Application]::DoEvents() } catch { }
-            }
+            # Progress four times a second; the window stays responsive
+            # in between (see Wait-ProcessResponsive).
+            [void](Wait-ProcessResponsive -Process $proc -Milliseconds 250)
             if ($script:CancelRequested) {
                 try { $proc.Kill() } catch { }
                 throw 'Cancelled'
@@ -152,7 +152,7 @@ function New-PartJobs {
         if ($duration -le 0.2) { continue }
 
         $plan = Get-EncodePlan -DurationSec $duration -TargetMB $TargetMB -AudioKbps $audioKbps `
-            -Mute $Mute -Width $Media.Width -Height $Media.Height -Fps $Media.Fps
+            -Mute $Mute -Width $Media.Width -Height $Media.Height -Fps $Media.Fps -Hdr ([bool]$Media.Hdr)
 
         $number = $i + 1
         $fileName = '{0}_part{1}_of_{2}.mp4' -f $title, $number.ToString("D$digits"), $count.ToString("D$digits")
@@ -174,24 +174,164 @@ function New-PartJobs {
     return $jobs
 }
 
+function Get-PartStatePath {
+    param([string]$OutDir)
+    return (Join-Path $OutDir '.videomail-parts.txt')
+}
+
+function Read-PartState {
+    param([string]$OutDir)
+    # One line per finished part: file name <TAB> settings fingerprint.
+    $state = @{}
+    $path = Get-PartStatePath $OutDir
+    if (-not (Test-Path -LiteralPath $path)) { return $state }
+    foreach ($line in @(Get-Content -LiteralPath $path -Encoding UTF8)) {
+        $bits = ([string]$line) -split "`t"
+        if ($bits.Count -eq 2 -and $bits[0]) { $state[$bits[0]] = $bits[1] }
+    }
+    return $state
+}
+
+function Save-PartState {
+    param([string]$OutDir, [string]$FileName, [string]$Fingerprint)
+    $state = Read-PartState $OutDir
+    $state[$FileName] = $Fingerprint
+    $path = Get-PartStatePath $OutDir
+    $lines = [string[]]@($state.Keys | Sort-Object | ForEach-Object { "$_`t$($state[$_])" })
+    try {
+        # A hidden file cannot be overwritten in place, so unhide it first.
+        if (Test-Path -LiteralPath $path) { (Get-Item -LiteralPath $path -Force).Attributes = 'Normal' }
+        [IO.File]::WriteAllLines($path, $lines, (New-Object System.Text.UTF8Encoding($false)))
+        if ($env:OS -eq 'Windows_NT') { (Get-Item -LiteralPath $path -Force).Attributes = 'Hidden' }
+    } catch {
+        # Not fatal: without the record this part is simply made again next time.
+        Write-FileLog ('Could not record finished part: ' + $_.Exception.Message)
+    }
+}
+
+function Get-JobFingerprint {
+    param([pscustomobject]$Job, [string]$Quality)
+    # Everything that decides what a part should contain. A finished part is
+    # reused only when this matches, so changing mute, size, part length,
+    # quality or the source never reuses a stale part. Only a hash is stored.
+    $src = Get-Item -LiteralPath $Job.Source
+    $key = @(
+        'v2', $src.FullName.ToLowerInvariant(), $src.Length, $src.LastWriteTimeUtc.Ticks,
+        (Format-Seconds $Job.Start), (Format-Seconds $Job.Duration),
+        $Job.Plan.TargetBytes, $Job.Plan.AudioKbps, $Job.Plan.VideoFilter, $Quality
+    ) -join '|'
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($key))
+    } finally {
+        $sha.Dispose()
+    }
+    return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
 function Test-ExistingPart {
-    param([pscustomobject]$Job)
+    param([pscustomobject]$Job, [string]$Fingerprint, [hashtable]$State)
     if (-not (Test-Path -LiteralPath $Job.Output)) { return $false }
+    if (-not $State -or [string]$State[$Job.FileName] -ne $Fingerprint) { return $false }
     $size = (Get-Item -LiteralPath $Job.Output).Length
-    return ($size -ge ($Job.Plan.TargetBytes * 0.40) -and $size -le ($Job.Plan.TargetBytes * 1.01))
+    return ($size -gt 1000 -and $size -le ($Job.Plan.TargetBytes * 1.01))
+}
+
+function Get-EncoderCandidates {
+    param([string]$Quality, [string]$Preset, [string]$Mode = 'auto')
+
+    $cpu1 = [pscustomobject]@{ Id = 'x264'; Name = (Get-Str 'encCpu1'); Gpu = $false; TwoPass = $false; Preset = $Preset; PixFmt = 'yuv420p' }
+    $cpu2 = [pscustomobject]@{ Id = 'x264'; Name = (Get-Str 'encCpu2'); Gpu = $false; TwoPass = $true; Preset = $Preset; PixFmt = 'yuv420p' }
+
+    # "Best" keeps the slow two-pass x264 encode: it gives the most quality
+    # per megabyte. The other settings take the graphics chip when it works.
+    if ($Quality -eq 'best') { return @($cpu2) }
+    if ($Mode -eq 'cpu') { return @($cpu1) }
+
+    $gpu = @(
+        @('nvenc', 'NVIDIA NVENC'),
+        @('nvenc-basic', 'NVIDIA NVENC'),
+        @('qsv', 'Intel Quick Sync'),
+        @('amf', 'AMD AMF')
+    ) | ForEach-Object {
+        [pscustomobject]@{ Id = $_[0]; Name = ((Get-Str 'encGpu') -f $_[1]); Gpu = $true; TwoPass = $false; Preset = ''; PixFmt = 'nv12' }
+    }
+    return @($gpu) + @($cpu1)
+}
+
+function Get-EncoderFilter {
+    param([pscustomobject]$Plan, [pscustomobject]$Encoder)
+    return ($Plan.VideoFilter -replace 'format=yuv420p$', ('format=' + $Encoder.PixFmt))
+}
+
+function Get-VideoEncoderArgs {
+    param([pscustomobject]$Encoder, [int]$Kbps)
+
+    $b = '{0}k' -f $Kbps
+    # Peak-rate cap: keeps every part close to its budget in one pass.
+    $vbv = @('-b:v', $b, '-maxrate', ('{0}k' -f [int]($Kbps * 1.5)), '-bufsize', ('{0}k' -f ($Kbps * 2)))
+    switch ($Encoder.Id) {
+        'nvenc' {
+            return @('-c:v', 'h264_nvenc', '-preset', 'p5', '-tune', 'hq', '-rc', 'vbr',
+                '-multipass', 'qres', '-spatial-aq', '1', '-rc-lookahead', '20', '-profile:v', 'high') + $vbv
+        }
+        'nvenc-basic' {
+            # Older NVIDIA cards / drivers without multipass or lookahead.
+            return @('-c:v', 'h264_nvenc', '-preset', 'p4', '-rc', 'vbr', '-profile:v', 'high') + $vbv
+        }
+        'qsv' {
+            return @('-c:v', 'h264_qsv', '-preset', 'slow', '-profile:v', 'high') + $vbv
+        }
+        'amf' {
+            return @('-c:v', 'h264_amf', '-usage', 'transcoding', '-quality', 'quality',
+                '-rc', 'vbr_peak', '-profile:v', 'high') + $vbv
+        }
+    }
+    $x264 = @('-c:v', 'libx264', '-preset', $Encoder.Preset, '-profile:v', 'high', '-level', '4.0', '-pix_fmt', 'yuv420p')
+    if ($Encoder.TwoPass) { return $x264 + @('-b:v', $b) }
+    return $x264 + $vbv
+}
+
+function Select-VideoEncoder {
+    param([pscustomobject]$Job, [string]$Quality, [string]$Preset, [string]$Mode)
+
+    $candidates = @(Get-EncoderCandidates -Quality $Quality -Preset $Preset -Mode $Mode)
+    $key = "$Quality|$Mode"
+    if ($script:EncoderCache.ContainsKey($key)) {
+        $hit = @($candidates | Where-Object { $_.Id -eq $script:EncoderCache[$key] }) | Select-Object -First 1
+        if ($hit) { return $hit }
+    }
+    foreach ($enc in $candidates) {
+        if (-not $enc.Gpu) {
+            $script:EncoderCache[$key] = $enc.Id
+            return $enc
+        }
+        # Encode one second of the real video with the real settings. This
+        # proves the chip, the driver and this video's format all work.
+        $probe = @(
+            '-hide_banner', '-nostdin', '-loglevel', 'error',
+            '-ss', (Format-Seconds $Job.Start), '-t', (Format-Seconds ([math]::Min(1.0, $Job.Duration))),
+            '-i', $Job.Source, '-map', '0:V:0', '-an', '-vf', (Get-EncoderFilter -Plan $Job.Plan -Encoder $enc)
+        ) + @(Get-VideoEncoderArgs -Encoder $enc -Kbps $Job.Plan.VideoKbps) + @('-f', 'null', (Get-NullDevice))
+        $r = Invoke-FFmpegCapture -Arguments $probe -TimeoutMs 30000
+        if ($r.ExitCode -eq 0) {
+            $script:EncoderCache[$key] = $enc.Id
+            return $enc
+        }
+        $why = if ($r.TimedOut) { 'timed out' } else { (($r.Text -split "`r?`n" | Where-Object { $_ }) | Select-Object -Last 2) -join ' ' }
+        Write-FileLog ('Encoder {0} not usable here: {1}' -f $enc.Id, $why)
+    }
+    throw 'Internal error: no encoder candidates.'
 }
 
 function Invoke-EncodeJob {
     param(
         [pscustomobject]$Job,
-        [string]$Preset,
-        [string]$TempDir
+        [pscustomobject]$Encoder,
+        [string]$TempDir,
+        [string]$Fingerprint,
+        [string]$OutDir
     )
-
-    if (Test-ExistingPart -Job $Job) {
-        Write-AppLog ((Get-Str 'logReuse') -f $Job.FileName)
-        return
-    }
 
     $plan = $Job.Plan
     $partial = $Job.Output + '.part'
@@ -200,6 +340,7 @@ function Invoke-EncodeJob {
     $passLog = Join-Path $TempDir ('pass_' + [guid]::NewGuid().ToString('N'))
     $progress = Join-Path $TempDir 'progress.txt'
     $nullDev = Get-NullDevice
+    $vf = Get-EncoderFilter -Plan $plan -Encoder $Encoder
 
     $common = @(
         '-hide_banner', '-nostdin', '-loglevel', 'error', '-y',
@@ -208,46 +349,40 @@ function Invoke-EncodeJob {
         '-i', $Job.Source
     )
 
-    # Pass 1: analysis only.
-    $args1 = $common + @(
-        '-map', '0:v:0', '-an', '-vf', $plan.VideoFilter,
-        '-c:v', 'libx264', '-preset', $Preset, '-profile:v', 'high', '-level', '4.0',
-        '-pix_fmt', 'yuv420p', '-b:v', ("{0}k" -f $plan.VideoKbps),
-        '-pass', '1', '-passlogfile', $passLog,
-        '-progress', $progress, '-nostats', '-f', 'null', $nullDev
-    )
-
-    $script:CurPassStart = 0.0
-    $script:CurPassLen = 0.45
-    Invoke-FFmpeg -Arguments $args1 -ProgressFile $progress -ExpectedSeconds $Job.Duration -OnTick {
-        param($frac, $speed, $elapsed)
-        Update-OverallProgress -Fraction $frac -Speed $speed -Elapsed $elapsed -Stage (Get-Str 'stageOptimising')
+    $outStart = 0.0
+    if ($Encoder.TwoPass) {
+        # Pass 1: analysis only.
+        $args1 = $common + @('-map', '0:V:0', '-an', '-vf', $vf) +
+            @(Get-VideoEncoderArgs -Encoder $Encoder -Kbps $plan.VideoKbps) +
+            @('-pass', '1', '-passlogfile', $passLog, '-progress', $progress, '-nostats', '-f', 'null', $nullDev)
+        $script:CurPassStart = 0.0
+        $script:CurPassLen = 0.45
+        Invoke-FFmpeg -Arguments $args1 -ProgressFile $progress -ExpectedSeconds $Job.Duration -OnTick {
+            param($frac, $speed, $elapsed)
+            Update-OverallProgress -Fraction $frac -Speed $speed -Elapsed $elapsed -Stage (Get-Str 'stageOptimising')
+        }
+        $outStart = 0.45
     }
 
-    $args2 = $common + @('-map', '0:v:0')
+    $audio = @('-an')
     if ($plan.AudioKbps -gt 0) {
         $channels = if ($Job.Channels -eq 1) { '1' } else { '2' }
-        $args2 += @(
-            '-map', '0:a:0?', '-c:a', 'aac', '-b:a', ("{0}k" -f $plan.AudioKbps),
-            '-ac', $channels, '-ar', '48000'
-        )
-    } else {
-        $args2 += @('-an')
+        $audio = @('-map', '0:a:0?', '-c:a', 'aac', '-b:a', ("{0}k" -f $plan.AudioKbps), '-ac', $channels, '-ar', '48000')
     }
-    $args2 += @(
-        '-vf', $plan.VideoFilter,
-        '-c:v', 'libx264', '-preset', $Preset, '-profile:v', 'high', '-level', '4.0',
-        '-pix_fmt', 'yuv420p', '-b:v', ("{0}k" -f $plan.VideoKbps),
-        '-pass', '2', '-passlogfile', $passLog,
-        '-map_metadata', '-1', '-movflags', '+faststart',
-        '-progress', $progress, '-nostats', '-f', 'mp4', $partial
-    )
 
     $attempt = 0
     while ($true) {
         $attempt++
-        $script:CurPassStart = 0.45
-        $script:CurPassLen = 0.55
+        $args2 = $common + @('-map', '0:V:0') + $audio + @('-vf', $vf) +
+            @(Get-VideoEncoderArgs -Encoder $Encoder -Kbps $plan.VideoKbps)
+        if ($Encoder.TwoPass) { $args2 += @('-pass', '2', '-passlogfile', $passLog) }
+        $args2 += @($plan.ColorArgs) + @(
+            '-map_metadata', '-1', '-movflags', '+faststart',
+            '-progress', $progress, '-nostats', '-f', 'mp4', $partial
+        )
+
+        $script:CurPassStart = $outStart
+        $script:CurPassLen = 1.0 - $outStart
         Invoke-FFmpeg -Arguments $args2 -ProgressFile $progress -ExpectedSeconds $Job.Duration -OnTick {
             param($frac, $speed, $elapsed)
             Update-OverallProgress -Fraction $frac -Speed $speed -Elapsed $elapsed -Stage (Get-Str 'stageEncoding')
@@ -262,18 +397,18 @@ function Invoke-EncodeJob {
             break
         }
 
-        # Only pass 2 needs to run again; the pass-1 analysis is still valid.
+        # Too large: encode again at a proportionally lower bitrate. For
+        # two-pass x264 only pass 2 runs again; pass-1 analysis stays valid.
         $factor = ($plan.TargetBytes * 0.97) / $size
         $newKbps = [int][math]::Floor($plan.VideoKbps * $factor)
         if ($newKbps -lt 80) { $newKbps = 80 }
         Write-AppLog ((Get-Str 'logRetry') -f $Job.PartNumber, $newKbps)
         $plan.VideoKbps = $newKbps
-        $idx = [array]::IndexOf($args2, '-b:v')
-        if ($idx -ge 0) { $args2[$idx + 1] = ("{0}k" -f $newKbps) }
         Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
     }
 
     Move-Item -LiteralPath $partial -Destination $Job.Output -Force
+    Save-PartState -OutDir $OutDir -FileName $Job.FileName -Fingerprint $Fingerprint
     $finalSize = (Get-Item -LiteralPath $Job.Output).Length
     Write-AppLog ((Get-Str 'logSaved') -f $Job.FileName, (Format-MB $finalSize))
 }
@@ -295,11 +430,14 @@ function Update-OverallProgress {
 
     $speedText = ''
     if ($Speed -gt 0) { $speedText = ((Get-Str 'speedTemplate') -f $Speed) }
+    # ETA from the work actually encoded in this run: parts reused from an
+    # earlier run finish instantly and would make the estimate far too short.
     $etaText = ''
-    $totalElapsed = $Elapsed
-    if ($script:JobClock) { $totalElapsed = $script:JobClock.Elapsed.TotalSeconds }
-    if ($overall -gt 0.02 -and $totalElapsed -gt 3) {
-        $eta = ($totalElapsed / $overall) - $totalElapsed
+    $etaElapsed = $Elapsed
+    if ($script:EtaClock) { $etaElapsed = $script:EtaClock.Elapsed.TotalSeconds }
+    $doneHere = $overall - [double]$script:EtaBase
+    if ($doneHere -gt 0.02 -and $etaElapsed -gt 3) {
+        $eta = ($etaElapsed / $doneHere) * (1.0 - $overall)
         if ($eta -gt 0) { $etaText = ((Get-Str 'etaTemplate') -f (Format-Eta $eta)) }
     }
 
@@ -311,6 +449,9 @@ function Update-OverallProgress {
         try {
             $script:UiProgress.Value = [int][math]::Round($overall * 1000)
             $script:UiStatus.Text = $text
+            # Shown on the taskbar button, so progress is visible while minimised.
+            $title = (Protect-LtrRuns ('{0}%' -f [int][math]::Floor($overall * 100))) + ' - ' + (Get-Str 'windowTitle')
+            if ($script:UiForm -and $script:UiForm.Text -ne $title) { $script:UiForm.Text = $title }
         } catch { }
         try { [System.Windows.Forms.Application]::DoEvents() } catch { }
     } else {

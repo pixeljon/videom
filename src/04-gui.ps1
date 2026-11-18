@@ -56,9 +56,25 @@ function Update-ListFromInputs {
 function Add-VideoFiles {
     param([string[]]$Paths)
     if (-not $Paths -or $Paths.Count -eq 0) { return }
+    # The window keeps handling clicks while videos are read, so ignore new
+    # drops and the green button until this read is finished.
+    if ($script:ReadingVideos) { return }
+    $script:ReadingVideos = $true
+    $goWasEnabled = $true
+    if ($script:UiGo) { $goWasEnabled = $script:UiGo.Enabled; $script:UiGo.Enabled = $false }
+    try {
+        Add-VideoFilesCore -Paths $Paths
+    } finally {
+        $script:ReadingVideos = $false
+        if ($script:UiGo) { $script:UiGo.Enabled = $goWasEnabled }
+    }
+}
+
+function Add-VideoFilesCore {
+    param([string[]]$Paths)
 
     # Accept dropped folders too: take the video files directly inside them.
-    $mediaExt = '^\.(mp4|mov|m4v|mkv|webm|avi|wmv|asf|flv|ts|mts|m2ts|mpg|mpeg|3gp|3g2)$'
+    $mediaExt = '^\.(mp4|mov|m4v|mkv|webm|avi|wmv|asf|flv|f4v|ts|mts|m2ts|mpg|mpeg|vob|mod|tod|dv|ogv|mxf|divx|3gp|3g2)$'
     $queue = New-Object System.Collections.ArrayList
     foreach ($p in $Paths) {
         if (Test-Path -LiteralPath $p -PathType Container) {
@@ -114,7 +130,7 @@ function Show-OpenVideoDialog {
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
     $dlg.Multiselect = $true
     $dlg.Title = (Get-Str 'chooseVideos')
-    $dlg.Filter = (Get-Str 'filterVideos') + '|*.mp4;*.mov;*.m4v;*.mkv;*.webm;*.avi;*.wmv;*.asf;*.flv;*.ts;*.mts;*.m2ts;*.mpg;*.mpeg;*.3gp;*.3g2|' +
+    $dlg.Filter = (Get-Str 'filterVideos') + '|*.mp4;*.mov;*.m4v;*.mkv;*.webm;*.avi;*.wmv;*.asf;*.flv;*.f4v;*.ts;*.mts;*.m2ts;*.mpg;*.mpeg;*.vob;*.mod;*.tod;*.dv;*.ogv;*.mxf;*.divx;*.3gp;*.3g2|' +
         (Get-Str 'filterAll') + '|*.*'
     if ($dlg.ShowDialog() -eq 'OK') {
         Add-VideoFiles -Paths $dlg.FileNames
@@ -306,7 +322,29 @@ function Show-OptionsDialog {
     Update-InputSummary
 }
 
+function Set-TaskbarIdentity {
+    # VideoMail runs inside powershell.exe, so Windows groups its taskbar
+    # button with PowerShell and shows PowerShell's icon. Giving the process
+    # its own AppUserModelID before any window opens makes the taskbar treat
+    # it as a separate app and use VideoMail's window icon instead.
+    if ($env:OS -ne 'Windows_NT') { return }
+    try {
+        if (-not ('VideoMail.Shell' -as [type])) {
+            Add-Type -Namespace VideoMail -Name Shell -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern int SetCurrentProcessExplicitAppUserModelID(string appID);
+'@
+        }
+        $hr = [VideoMail.Shell]::SetCurrentProcessExplicitAppUserModelID('VideoMail.App')
+        if ($hr -ne 0) { Write-FileLog ('Taskbar identity not set (HRESULT 0x{0:X8}).' -f $hr) }
+    } catch {
+        # Cosmetic only: without it the taskbar shows the PowerShell icon.
+        Write-FileLog ('Taskbar identity not set: ' + $_.Exception.Message)
+    }
+}
+
 function Show-Gui {
+    Set-TaskbarIdentity
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -346,9 +384,18 @@ function Show-Gui {
         $form.RightToLeftLayout = $true
     }
     $script:UiForm = $form
+    # The .ico holds every size (16-256 px), so the title bar, Alt+Tab and
+    # the taskbar each get a sharp image at any display scaling.
+    $icoPath = Join-Path $script:AppDir 'videomail.ico'
     $exePath = Join-Path $script:AppDir 'VideoMail.exe'
-    if (Test-Path -LiteralPath $exePath) {
-        try { $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath) } catch { }
+    try {
+        if (Test-Path -LiteralPath $icoPath) {
+            $form.Icon = New-Object System.Drawing.Icon($icoPath)
+        } elseif (Test-Path -LiteralPath $exePath) {
+            $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath)
+        }
+    } catch {
+        Write-FileLog ('Could not load the window icon: ' + $_.Exception.Message)
     }
 
     $root = New-Object System.Windows.Forms.TableLayoutPanel
@@ -433,6 +480,10 @@ function Show-Gui {
     $dropSub.ForeColor = [System.Drawing.Color]::FromArgb(70, 100, 130)
     $dropSub.Cursor = 'Hand'
     $drop.Controls.Add($dropSub)
+    # Docking runs in reverse z-order: the Fill label must be at the front so
+    # it takes only the space left under the title. Otherwise it fills the
+    # whole panel and its text is hidden behind the title.
+    $dropSub.BringToFront()
 
     foreach ($c in @($drop, $dropTitle, $dropSub)) {
         $c.Add_Click({ Show-OpenVideoDialog })
@@ -594,6 +645,7 @@ function Show-Gui {
     $bottom.Controls.SetChildIndex($buttonPanel, 0)
 
     $go.Add_Click({
+        if ($script:ReadingVideos -or -not $script:UiGo.Enabled) { return }
         if ($script:UiList.Items.Count -eq 0) {
             [void](Show-MsgBox (Get-Str 'dropFirst') 'VideoMail' 'OK' 'Information')
             return
@@ -632,16 +684,22 @@ function Show-Gui {
             To        = $script:UiConfig.To
             NoDrafts  = $script:UiConfig.NoDrafts
             OnTick    = $null
+            EncoderMode = $EncoderMode
         }
 
         try {
             $result = Invoke-Batch -Config $config
-            $script:UiProgress.Value = 1000
 
             if ($result.Cancelled) {
+                $script:UiProgress.Value = 0
                 $script:UiStatus.Text = (Get-Str 'cancelledStatus')
-                [void](Show-MsgBox (Get-Str 'cancelledMsg') 'VideoMail' 'OK' 'Information')
+                $msg = (Get-Str 'cancelledMsg')
+                if ($result.KeptParts -gt 0 -and $result.NextPart -gt 0) {
+                    $msg = (Get-Str 'cancelledKept') -f $result.KeptParts, $result.NextPart
+                }
+                [void](Show-MsgBox $msg 'VideoMail' 'OK' 'Information')
             } else {
+                $script:UiProgress.Value = 1000
                 $script:UiStatus.Text = (Get-Str 'doneStatus')
                 $msg = (Get-Str 'doneBox1') + "`r`n`r`n" + ((Get-Str 'donePartsSaved') -f $result.PartCount) + "`r`n$outDir`r`n`r`n"
                 if ($result.DraftMode -eq 'outlook') {
@@ -666,6 +724,7 @@ function Show-Gui {
             [void](Show-MsgBox ((Get-Str 'somethingWrong') + "`r`n`r`n" + $_.Exception.Message + "`r`n`r`n" + (Get-Str 'errFatal2') + $script:LogPath) 'VideoMail' 'OK' 'Error')
         } finally {
             $script:UiGo.Enabled = $true
+            $script:UiForm.Text = (Get-Str 'windowTitle')
             $script:UiCancel.Visible = $false
             $script:UiOptionsBtn.Enabled = $true
         }

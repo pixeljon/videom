@@ -41,13 +41,16 @@ check the size, and prepare the emails.
 
 ## Quick start
 
-1. Download `VideoMail-1.0-win64.zip` from
+1. Download `VideoMail-1.1-win64.zip` from
    [Releases](../../releases/latest).
 2. Unzip it anywhere — the desktop, a USB stick, a folder.
 3. Double-click **VideoMail.exe**.
 4. Drag one or more videos onto the blue box.
 5. Press **Split & prepare emails**.
-6. Wait. A one-hour video takes roughly 20–60 minutes on a typical laptop.
+6. Wait. VideoMail uses the PC's graphics chip (NVIDIA, AMD or Intel) when
+   it can, which makes a one-hour video take roughly 5–15 minutes; on the
+   processor alone it is roughly 15–40 minutes. Cancel at any time: finished
+   parts are kept, and pressing the button again continues where it stopped.
 7. Open **Outlook → Drafts**, check the message, press **Send**.
 
 The parts are saved in a **VideoMail parts** folder next to the original
@@ -70,14 +73,25 @@ they open cleanly everywhere.
 
 ## How it works
 
-Each part is encoded independently with two-pass H.264 ABR. The bitrate is
-calculated from the size limit and the part length, with 2% headroom for
-container overhead. If the budget is too low for the source resolution, the
-video is scaled down (typically to 720p at 49 MB / 5 min). A tiny final part
-(under 5 seconds) is merged into the previous one.
+Each part is encoded independently to H.264. The bitrate is calculated from
+the size limit and the part length, with 2% headroom for container overhead.
+If the budget is too low for the source resolution, the video is scaled down
+(typically to 720p at 49 MB / 5 min), and anything above 30 fps is reduced to
+30 fps. A tiny final part (under 5 seconds) is merged into the previous one.
 
-Audio is AAC at 96 kbps stereo (64 kbps mono). Mute removes the audio track
-completely.
+- **Encoder.** The PC's graphics chip (NVIDIA NVENC, Intel Quick Sync or
+  AMD AMF) when one works, tested on one second of the real video;
+  otherwise x264 on the processor in one pass. *Best quality* uses two-pass
+  x264. A part that comes out too large is encoded again at a lower bitrate.
+- **HDR** phone videos are tone-mapped to normal colours.
+- **Audio** is AAC at 96 kbps stereo (64 kbps mono). Mute removes the audio
+  track completely.
+- **Cancel and continue.** Finished parts are kept and recorded (by a
+  settings fingerprint) in a hidden `.videomail-parts.txt`; the next run into
+  the same folder skips them, unless the settings changed.
+
+The full details, including what is inside `ffmpeg.exe` and why, are in
+[docs/how-it-is-built.md](docs/how-it-is-built.md).
 
 ## Options
 
@@ -86,7 +100,7 @@ completely.
 | Language | the Windows language | Eight choices; remembered once you pick one. |
 | Maximum size per email | 49 MB | Lower it to 35 MB if your mail server rejects large messages. |
 | Part length | 5 minutes | 1–30 minutes. |
-| Quality | Balanced | Best quality / Balanced / Fastest. |
+| Quality | Balanced | Balanced and Fastest use the graphics chip when it works, otherwise one processor pass. Best quality always does two processor passes (slowest, most quality per MB). |
 | Greeting | `Hello,` | First line of every draft. |
 | Send drafts to | empty | Optional; fills the To line. |
 | Save parts in | next to the source | Any folder. |
@@ -110,20 +124,61 @@ size.
 
 ## Supported input
 
-**Containers:** MP4, MOV, M4V, MKV, WebM, AVI, WMV, ASF, FLV, TS, MTS, M2TS,
-MPG, MPEG, 3GP, DV.
+**Containers:** MP4, MOV, M4V, MKV, WebM, AVI, WMV, ASF, FLV, F4V, TS, MTS,
+M2TS, MPG, MPEG, VOB, MOD, TOD, 3GP, DV, OGV, MXF.
 
-**Video:** H.264, HEVC, MPEG-2, MPEG-4, H.263, DV, VP8/VP9, AV1, WMV/VC-1,
-ProRes.
+**Video:** H.264, HEVC, AV1, VP8/VP9, MPEG-2, MPEG-4 (DivX/Xvid), H.263,
+Sorenson FLV, DV, WMV/VC-1, ProRes, DNxHD, MJPEG, Theora.
 
-**Audio:** AAC, MP3, MP2, AC3/E-AC3, FLAC, Opus, Vorbis, WMA, AMR.
+**Audio:** AAC, MP3, MP2, AC3/E-AC3, DTS, TrueHD, FLAC, ALAC, Opus, Vorbis,
+WMA/WMA Pro, AMR, PCM, ADPCM.
+
+**Phone videos:** iPhone and Android (Samsung, Pixel, ...) recordings work
+as they are, including portrait and rotated clips, 60/120 fps, 4K/8K, and
+HDR (HLG, HDR10/HDR10+, Dolby Vision 8.4), which is tone-mapped to normal
+SDR colours so it plays correctly everywhere.
+
+## Verify a download
+
+Official zips are built by GitHub Actions from a tagged commit of this
+repository, inside a pinned container, never on a personal computer. The
+only programs in the zip are `ffmpeg.exe` (with its `libwinpthread-1.dll`)
+and the small `VideoMail.exe` launcher (source: `assets/launcher.c`);
+everything else is readable text.
+
+Three ways to check a zip, quickest first:
+
+1. **Checksum.** Compare its SHA-256 with the one on the release page.
+   On Windows: `Get-FileHash .\VideoMail-1.1-win64.zip` in PowerShell.
+2. **Build provenance.** With the GitHub CLI:
+   `gh attestation verify VideoMail-1.1-win64.zip --repo pixeljon/videom`.
+   This proves the exact file came from this repository's release
+   workflow, and shows the commit it was built from.
+3. **Rebuild it yourself.** The build is reproducible: the same tag gives a
+   byte-identical zip. It needs Docker and takes about 10 minutes:
+
+   ```bash
+   git clone https://github.com/pixeljon/videom.git && cd videom
+   git checkout v1.1
+   docker build -t videomail-build build
+   docker run --rm --user "$(id -u):$(id -g)" \
+     -v "$PWD:/src:ro" -v "$PWD/out:/out" videomail-build
+   sha256sum out/VideoMail-1.1-win64.zip   # must equal the release's hash
+   ```
+
+What is pinned: the Debian base image by digest and its compiler packages
+by snapshot.debian.org date (`build/Dockerfile`), every source tarball by
+SHA-256 and every git source by commit (`build/reproducible-build.sh`).
+A source that does not match its pin stops the build.
 
 ## Build from source
 
-The Windows build is cross-compiled on Linux with mingw-w64.
+The easiest way is the container in "Verify a download" above; it is how
+releases are made. To build without Docker, cross-compile on Linux with
+mingw-w64; the result works the same but is not byte-identical to a release.
 
-Requirements: `mingw-w64`, `nasm`, `make`, `pkg-config`, `zip`, and
-PowerShell 7 (`pwsh`) for the self-test.
+Requirements: `mingw-w64` (gcc and g++), `nasm`, `make`, `pkg-config`,
+`meson`, `cmake`, `ninja`, `zip`, and PowerShell 7 (`pwsh`) for the self-test.
 
 ```bash
 # Sources (versions used for the release)
@@ -131,9 +186,17 @@ mkdir -p .build/src && cd .build/src
 curl -LO https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz
 tar xf ffmpeg-9.0.2.tar.xz
 git clone https://code.videolan.org/videolan/x264.git
+git -C x264 checkout 0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee
+curl -LO https://downloads.videolan.org/pub/videolan/dav1d/1.5.1/dav1d-1.5.1.tar.xz
+tar xf dav1d-1.5.1.tar.xz
+git clone --depth 1 --branch n11.1.5.3 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git
+curl -LO https://github.com/GPUOpen-LibrariesAndSDKs/AMF/releases/download/v1.5.3/AMF-headers-v1.5.3.tar.gz
+mkdir -p amf && tar xf AMF-headers-v1.5.3.tar.gz -C amf
+curl -L -o libvpl-2.17.0.tar.gz https://github.com/intel/libvpl/archive/refs/tags/v2.17.0.tar.gz
+tar xf libvpl-2.17.0.tar.gz
 cd ../..
 
-# Build ffmpeg.exe (minimal, static, with x264)
+# Build ffmpeg.exe (minimal, static, with x264, dav1d and GPU encoders)
 TC=/usr bash build/build-windows.sh
 
 # Assemble the portable folder and zip
@@ -154,8 +217,9 @@ contains no build-machine paths.
 VideoMail.ps1        generated single-file app
 src/                 app sources, split by area
 assets/              icon, version info, launcher source
-build/               Windows build and packaging scripts
-docs/                interface previews
+build/               Windows build, packaging, and the pinned release container
+.github/workflows/   self-test on every push; release build on version tags
+docs/                interface previews; how-it-is-built.md (build and verification)
 README.txt           the readme shipped inside the zip
 LICENSES.txt         third-party licenses
 ```
