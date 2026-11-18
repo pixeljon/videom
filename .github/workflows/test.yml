@@ -1,0 +1,16 @@
+name: test
+
+on: [push, pull_request]
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check generated script
+        run: |
+          printf '\xEF\xBB\xBF' > /tmp/VideoMail.ps1
+          cat src/01-core.ps1 src/02-strings.ps1 src/03-encode.ps1 src/04-gui.ps1 src/05-main.ps1 >> /tmp/VideoMail.ps1
+          diff -u VideoMail.ps1 /tmp/VideoMail.ps1
+      - name: Run self-test
+        run: pwsh -NoProfile -File ./VideoMail.ps1 -SelfTest
